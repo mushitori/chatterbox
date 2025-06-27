@@ -208,9 +208,29 @@ class ChatterboxTTS:
 
         with torch.inference_mode():
             def _t3_infer():
+                # Determine optimal max_new_tokens based on GPU
+                if torch.cuda.is_available():
+                    device_name = torch.cuda.get_device_name().lower()
+                    cuda_capability = torch.cuda.get_device_capability()[0]
+                    
+                    if "l4" in device_name or "rtx 4090" in device_name or "rtx 4080" in device_name:
+                        max_tokens = 1000  # Maximum for L4 and RTX 40 series
+                    elif "t4" in device_name or "rtx 3090" in device_name or "rtx 3080" in device_name:
+                        max_tokens = 800   # High for T4 and RTX 30 series
+                    elif cuda_capability >= 8:
+                        max_tokens = 600   # High for modern GPUs
+                    elif cuda_capability >= 7:
+                        max_tokens = 400   # Medium for mid-range GPUs
+                    elif cuda_capability >= 6:
+                        max_tokens = 200   # Conservative for older GPUs
+                    else:
+                        max_tokens = 100   # Very conservative for legacy GPUs
+                else:
+                    max_tokens = 100  # Conservative for CPU
+                
                 for token in self.t3.inference(
                     t3_cond=self.conds.t3, text_tokens=text_tokens,
-                    max_new_tokens=1000, temperature=temperature, cfg_weight=cfg_weight,
+                    max_new_tokens=max_tokens, temperature=temperature, cfg_weight=cfg_weight,
                 ):
                     yield token
             
@@ -272,3 +292,85 @@ class ChatterboxTTS:
                 tokens_with_eos = torch.cat([tokens, eos_token], dim=1)
                 wav, previous_length = speech_to_wav(tokens_with_eos, previous_length)
                 yield wav
+
+    def configure_t3_compilation(self, mode="reduce-overhead", dynamic=True, fullgraph=True, backend="inductor"):
+        """
+        Configure T3 model compilation for optimal performance.
+        
+        Args:
+            mode (str): Compilation mode. Options:
+                - "reduce-overhead": Fastest compilation, good for inference
+                - "max-autotune": Slower compilation, best performance
+                - "max-autotune-no-cudagraphs": Good balance
+            dynamic (bool): Enable dynamic shapes for better performance
+            fullgraph (bool): Compile the entire model graph
+            backend (str): Compilation backend ("inductor", "aot_eager", "aot_ts")
+        """
+        self.t3.configure_compilation(mode=mode, dynamic=dynamic, fullgraph=fullgraph, backend=backend)
+        print(f"T3 compilation configured: mode={mode}, dynamic={dynamic}, fullgraph={fullgraph}, backend={backend}")
+
+    def get_t3_compilation_info(self):
+        """
+        Get information about T3 model compilation status and settings.
+        """
+        return self.t3.get_compilation_info()
+
+    def check_gpu_compatibility(self):
+        """
+        Check GPU compatibility for different compilation backends.
+        """
+        return self.t3.check_gpu_compatibility()
+
+    def auto_configure_t3_compilation(self):
+        """
+        Automatically configure T3 compilation based on GPU compatibility.
+        """
+        self.t3.auto_configure_compilation()
+        print("T3 compilation auto-configured based on GPU compatibility.")
+
+    def configure_t3_cache_settings(self, cache_size_limit=600, suppress_errors=False):
+        """
+        Configure torch._dynamo cache settings for optimal performance.
+        
+        Args:
+            cache_size_limit (int): Maximum number of compiled functions to cache (default: 600)
+            suppress_errors (bool): Whether to suppress compilation errors (default: False)
+        """
+        self.t3.configure_cache_settings(cache_size_limit=cache_size_limit, suppress_errors=suppress_errors)
+        print(f"T3 cache settings configured: cache_size_limit={cache_size_limit}, suppress_errors={suppress_errors}")
+
+    def warmup_t3_model(self, text="Hello world", audio_prompt_path=None):
+        """
+        Warm up the T3 model by running a short inference to trigger compilation.
+        This should be called once after model loading for optimal performance.
+        
+        Args:
+            text (str): Short text for warmup
+            audio_prompt_path (str): Audio prompt path for warmup
+        """
+        print("Warming up T3 model for optimal performance...")
+        
+        if audio_prompt_path and self.conds is None:
+            self.prepare_conditionals(audio_prompt_path)
+        
+        if self.conds is None:
+            print("Warning: No conditionals available for warmup. Please provide audio_prompt_path.")
+            return
+        
+        # Run a short warmup inference
+        text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
+        sot, eot = self.t3.hp.start_text_token, self.t3.hp.stop_text_token
+        text_tokens = F.pad(F.pad(text_tokens, (1, 0), value=sot), (0, 1), value=eot)
+        
+        # Trigger compilation with a short inference
+        with torch.inference_mode():
+            for _ in self.t3.inference(
+                t3_cond=self.conds.t3, 
+                text_tokens=text_tokens,
+                max_new_tokens=10,  # Very short for warmup
+                temperature=0.8,
+                cfg_weight=0.0,
+            ):
+                break  # Just trigger compilation, don't need full generation
+        
+        print("T3 model warmup completed.")

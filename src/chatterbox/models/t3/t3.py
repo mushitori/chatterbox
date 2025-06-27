@@ -2,6 +2,7 @@
 # MIT License
 import logging
 from typing import Union, Optional, List
+import threading
 
 from tqdm import tqdm
 import torch
@@ -68,11 +69,306 @@ class T3(nn.Module):
         # logit projection
         self.text_head = nn.Linear(self.cfg.hidden_size, hp.text_tokens_dict_size, bias=False)
         self.speech_head = nn.Linear(self.cfg.hidden_size, hp.speech_tokens_dict_size, bias=False)
+        
+        # --- ADDED: Compilation state and thread safety ---
         self.compiled = False
+        self.compile_lock = threading.Lock()
+        self.patched_model = None
+        self.compiled_model = None
+        
+        # --- ADDED: Compilation configuration ---
+        self.compile_mode = "reduce-overhead"  # Options: "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"
+        self.compile_dynamic = True  # Enable dynamic shapes for better performance
+        self.compile_fullgraph = True  # Compile the entire model graph
 
     @property
     def device(self):
         return self.speech_head.weight.device
+
+    def _compile_model(self):
+        """
+        Compile the T3 model for optimized inference performance.
+        Uses torch.compile with optimized settings for TTS workloads.
+        """
+        if self.compiled:
+            return
+            
+        with self.compile_lock:
+            if self.compiled:  # Double-check after acquiring lock
+                return
+                
+            logger.info("Compiling T3 model for optimized inference...")
+            
+            try:
+                # --- ADDED: Configure torch._dynamo cache size ---
+                import torch._dynamo
+                # Increase cache size to prevent cache_size_limit errors
+                torch._dynamo.config.cache_size_limit = 600
+                # Disable recompilation warnings for cleaner logs
+                torch._dynamo.config.suppress_errors = False
+                # Enable more aggressive caching
+                torch._dynamo.config.cache_size_limit = 600
+                
+                logger.info(f"Configured torch._dynamo cache_size_limit: {torch._dynamo.config.cache_size_limit}")
+                
+                # Create the patched model for HuggingFace compatibility
+                patched_model = T3HuggingfaceBackend(
+                    config=self.cfg,
+                    llama=self.tfmr,
+                    speech_enc=self.speech_emb,
+                    speech_head=self.speech_head,
+                )
+                
+                # Get the configured backend or use default
+                backend = getattr(self, '_compile_backend', 'inductor')
+                
+                # --- ADDED: GPU capability check for inductor backend ---
+                if backend == "inductor" and torch.cuda.is_available():
+                    cuda_capability = torch.cuda.get_device_capability()
+                    cuda_capability_major = cuda_capability[0]
+                    
+                    if cuda_capability_major < 7:
+                        logger.warning(
+                            f"GPU CUDA capability {cuda_capability_major}.{cuda_capability[1]} "
+                            f"is too low for inductor backend (requires >= 7.0). "
+                            f"Falling back to aot_eager backend."
+                        )
+                        backend = "aot_eager"
+                        self._compile_backend = backend
+                
+                # Compile the model with optimized settings
+                compiled_model = torch.compile(
+                    patched_model,
+                    mode=self.compile_mode,
+                    dynamic=self.compile_dynamic,
+                    fullgraph=self.compile_fullgraph,
+                    backend=backend,
+                )
+                
+                self.patched_model = patched_model
+                self.compiled_model = compiled_model
+                self.compiled = True
+                
+                logger.info(f"T3 model compiled successfully with mode: {self.compile_mode}, backend: {backend}")
+                
+                # Log compilation info for debugging
+                compilation_info = self.get_compilation_info()
+                logger.info(f"Compilation settings: {compilation_info}")
+                
+            except Exception as e:
+                logger.warning(f"Model compilation failed: {e}. Falling back to uncompiled model.")
+                # Fallback to uncompiled model
+                self.patched_model = patched_model
+                self.compiled_model = patched_model
+                self.compiled = True
+
+    def _get_compiled_model(self):
+        """
+        Get the compiled model, compiling if necessary.
+        """
+        if not self.compiled:
+            self._compile_model()
+        return self.compiled_model
+
+    def configure_compilation(self, mode="reduce-overhead", dynamic=True, fullgraph=True, backend="inductor"):
+        """
+        Configure compilation settings for optimal performance.
+        
+        Args:
+            mode (str): Compilation mode. Options:
+                - "reduce-overhead": Fastest compilation, good for inference
+                - "max-autotune": Slower compilation, best performance
+                - "max-autotune-no-cudagraphs": Good balance
+            dynamic (bool): Enable dynamic shapes for better performance
+            fullgraph (bool): Compile the entire model graph
+            backend (str): Compilation backend ("inductor", "aot_eager", "aot_ts")
+        """
+        if self.compiled:
+            logger.warning("Model already compiled. Recompilation will occur on next inference.")
+            self.compiled = False
+            
+        self.compile_mode = mode
+        self.compile_dynamic = dynamic
+        self.compile_fullgraph = fullgraph
+        
+        # Store backend for compilation
+        self._compile_backend = backend
+        
+        logger.info(f"Compilation configured: mode={mode}, dynamic={dynamic}, fullgraph={fullgraph}, backend={backend}")
+
+    def get_compilation_info(self):
+        """
+        Get information about the current compilation status and settings.
+        """
+        return {
+            "compiled": self.compiled,
+            "mode": self.compile_mode,
+            "dynamic": self.compile_dynamic,
+            "fullgraph": self.compile_fullgraph,
+            "backend": getattr(self, '_compile_backend', 'inductor'),
+        }
+
+    def check_gpu_compatibility(self):
+        """
+        Check GPU compatibility for different compilation backends.
+        Returns a dictionary with compatibility information.
+        """
+        compatibility_info = {
+            "cuda_available": torch.cuda.is_available(),
+            "device_name": None,
+            "cuda_capability": None,
+            "supported_backends": [],
+            "recommended_backend": None,
+            "gpu_type": None,
+            "optimization_level": None,
+        }
+        
+        if torch.cuda.is_available():
+            compatibility_info["device_name"] = torch.cuda.get_device_name()
+            compatibility_info["cuda_capability"] = torch.cuda.get_device_capability()
+            
+            cuda_major = compatibility_info["cuda_capability"][0]
+            device_name = compatibility_info["device_name"].lower()
+            
+            # Detect specific GPU types for specialized optimization
+            if "t4" in device_name:
+                compatibility_info["gpu_type"] = "T4"
+                compatibility_info["optimization_level"] = "high"
+                # T4 has CUDA 7.5 capability, supports all backends
+                compatibility_info["supported_backends"] = ["inductor", "aot_eager", "aot_ts"]
+                compatibility_info["recommended_backend"] = "inductor"
+                
+            elif "l4" in device_name:
+                compatibility_info["gpu_type"] = "L4"
+                compatibility_info["optimization_level"] = "maximum"
+                # L4 has CUDA 8.9 capability, excellent for all optimizations
+                compatibility_info["supported_backends"] = ["inductor", "aot_eager", "aot_ts"]
+                compatibility_info["recommended_backend"] = "inductor"
+                
+            elif "rtx" in device_name and ("4090" in device_name or "4080" in device_name or "3090" in device_name):
+                compatibility_info["gpu_type"] = "RTX_40/30_Series"
+                compatibility_info["optimization_level"] = "maximum"
+                compatibility_info["supported_backends"] = ["inductor", "aot_eager", "aot_ts"]
+                compatibility_info["recommended_backend"] = "inductor"
+                
+            elif "rtx" in device_name or "gtx" in device_name:
+                if cuda_major >= 8:
+                    compatibility_info["gpu_type"] = "RTX_20/30_Series"
+                    compatibility_info["optimization_level"] = "high"
+                    compatibility_info["supported_backends"] = ["inductor", "aot_eager", "aot_ts"]
+                    compatibility_info["recommended_backend"] = "inductor"
+                elif cuda_major >= 7:
+                    compatibility_info["gpu_type"] = "GTX_16/20_Series"
+                    compatibility_info["optimization_level"] = "medium"
+                    compatibility_info["supported_backends"] = ["inductor", "aot_eager", "aot_ts"]
+                    compatibility_info["recommended_backend"] = "inductor"
+                else:
+                    compatibility_info["gpu_type"] = "GTX_10_Series"
+                    compatibility_info["optimization_level"] = "low"
+                    compatibility_info["supported_backends"] = ["aot_eager", "aot_ts"]
+                    compatibility_info["recommended_backend"] = "aot_eager"
+            else:
+                # Generic detection based on CUDA capability
+                if cuda_major >= 8:
+                    compatibility_info["gpu_type"] = "High_End"
+                    compatibility_info["optimization_level"] = "maximum"
+                    compatibility_info["supported_backends"] = ["inductor", "aot_eager", "aot_ts"]
+                    compatibility_info["recommended_backend"] = "inductor"
+                elif cuda_major >= 7:
+                    compatibility_info["gpu_type"] = "Mid_Range"
+                    compatibility_info["optimization_level"] = "high"
+                    compatibility_info["supported_backends"] = ["inductor", "aot_eager", "aot_ts"]
+                    compatibility_info["recommended_backend"] = "inductor"
+                elif cuda_major >= 6:
+                    compatibility_info["gpu_type"] = "Entry_Level"
+                    compatibility_info["optimization_level"] = "low"
+                    compatibility_info["supported_backends"] = ["aot_eager", "aot_ts"]
+                    compatibility_info["recommended_backend"] = "aot_eager"
+                else:
+                    compatibility_info["gpu_type"] = "Legacy"
+                    compatibility_info["optimization_level"] = "minimal"
+                    compatibility_info["supported_backends"] = ["aot_eager"]
+                    compatibility_info["recommended_backend"] = "aot_eager"
+        else:
+            compatibility_info["supported_backends"] = ["aot_eager"]
+            compatibility_info["recommended_backend"] = "aot_eager"
+            compatibility_info["gpu_type"] = "CPU"
+            compatibility_info["optimization_level"] = "minimal"
+        
+        return compatibility_info
+
+    def auto_configure_compilation(self):
+        """
+        Automatically configure compilation based on GPU compatibility.
+        """
+        compatibility = self.check_gpu_compatibility()
+        
+        if not compatibility["cuda_available"]:
+            logger.info("CUDA not available. Using CPU-optimized compilation.")
+            self.configure_compilation(mode="reduce-overhead", backend="aot_eager")
+            return
+        
+        device_name = compatibility["device_name"]
+        cuda_capability = compatibility["cuda_capability"]
+        recommended_backend = compatibility["recommended_backend"]
+        gpu_type = compatibility["gpu_type"]
+        optimization_level = compatibility["optimization_level"]
+        
+        logger.info(f"GPU: {device_name}")
+        logger.info(f"GPU Type: {gpu_type}")
+        logger.info(f"CUDA Capability: {cuda_capability[0]}.{cuda_capability[1]}")
+        logger.info(f"Optimization Level: {optimization_level}")
+        logger.info(f"Recommended backend: {recommended_backend}")
+        
+        # Configure based on GPU type and optimization level
+        if optimization_level == "maximum":
+            # For L4, RTX 40/30 series - maximum performance
+            self.configure_compilation(mode="max-autotune", backend="inductor")
+            logger.info("Configured for maximum performance (max-autotune + inductor)")
+            
+        elif optimization_level == "high":
+            # For T4, RTX 20/30 series - high performance
+            self.configure_compilation(mode="reduce-overhead", backend="inductor")
+            logger.info("Configured for high performance (reduce-overhead + inductor)")
+            
+        elif optimization_level == "medium":
+            # For GTX 16/20 series - medium performance
+            self.configure_compilation(mode="reduce-overhead", backend="inductor")
+            logger.info("Configured for medium performance (reduce-overhead + inductor)")
+            
+        elif optimization_level == "low":
+            # For GTX 10 series - conservative performance
+            self.configure_compilation(mode="reduce-overhead", backend="aot_eager")
+            logger.info("Configured for conservative performance (reduce-overhead + aot_eager)")
+            
+        else:
+            # Fallback for minimal optimization
+            self.configure_compilation(mode="reduce-overhead", backend="aot_eager")
+            logger.info("Configured for minimal optimization (reduce-overhead + aot_eager)")
+            
+        logger.info(f"Auto-configured compilation for {gpu_type} with {optimization_level} optimization")
+
+    def configure_cache_settings(self, cache_size_limit=600, suppress_errors=False):
+        """
+        Configure torch._dynamo cache settings for optimal performance.
+        
+        Args:
+            cache_size_limit (int): Maximum number of compiled functions to cache (default: 600)
+            suppress_errors (bool): Whether to suppress compilation errors (default: False)
+        """
+        import torch._dynamo
+        
+        # Configure cache settings
+        torch._dynamo.config.cache_size_limit = cache_size_limit
+        torch._dynamo.config.suppress_errors = suppress_errors
+        
+        logger.info(f"Configured torch._dynamo cache_size_limit: {cache_size_limit}")
+        logger.info(f"Configured torch._dynamo suppress_errors: {suppress_errors}")
+        
+        # Reset compilation state to apply new settings
+        if self.compiled:
+            logger.info("Resetting compilation state to apply new cache settings...")
+            self.compiled = False
 
     def prepare_conditioning(self, t3_cond: T3Cond):
         """
@@ -249,47 +545,8 @@ class T3(nn.Module):
             cfg_weight=cfg_weight,
         )
 
-        # In order to use the standard HF generate method, we need to extend some methods to inject our custom logic
-        # Note the llama-specific logic. Other tfmr types can be added later.
-
-        # self.compiled = False
-
-        # TODO? synchronize the expensive compile function
-        # with self.compile_lock:
-        if not self.compiled:
-            # alignment_stream_analyzer = AlignmentStreamAnalyzer(
-            #     self.tfmr,
-            #     None,
-            #     text_tokens_slice=(len_cond, len_cond + text_tokens.size(-1)),
-            #     alignment_layer_idx=9, # TODO: hparam or something?
-            #     eos_idx=self.hp.stop_speech_token,
-            # )
-            patched_model = T3HuggingfaceBackend(
-                config=self.cfg,
-                llama=self.tfmr,
-                speech_enc=self.speech_emb,
-                speech_head=self.speech_head,
-                # alignment_stream_analyzer=alignment_stream_analyzer,
-            )
-            self.patched_model = patched_model
-            self.compiled = True
-
-        # # Run normal generate method, which calls our custom extended methods
-        # return self.patched_model.generate(
-        #     inputs=initial_speech_tokens,
-        #     decoder_cond=embeds,
-        #     bos_token_id=self.hp.start_speech_token,
-        #     eos_token_id=(self.hp.stop_speech_token if stop_on_eos else -1),
-        #     pad_token_id=self.hp.stop_speech_token,
-        #     max_new_tokens=max_new_tokens or self.hp.max_speech_tokens,
-        #     num_return_sequences=num_return_sequences,
-        #     temperature=temperature,
-        #     top_p=top_p,
-        #     length_penalty=length_penalty,
-        #     repetition_penalty=repetition_penalty,
-        #     do_sample=do_sample,
-        #     # cache_implementation=None if not self.compiled else "static",
-        # )
+        # --- MODIFIED: Use compiled model for inference ---
+        compiled_model = self._get_compiled_model()
 
         device = embeds.device
 
@@ -314,16 +571,52 @@ class T3(nn.Module):
         top_p_warper = TopPLogitsWarper(top_p=top_p)
         repetition_penalty_processor = RepetitionPenaltyLogitsProcessor(penalty=repetition_penalty)
 
-        # past_key_values = StaticCache(
-        #     config=self.patched_model.config,
-        #     max_batch_size=1,
-        #     max_cache_len=max_new_tokens,
-        #     device=self.patched_model.device,
-        #     dtype=self.patched_model.dtype,
-        # )
+        # --- MODIFIED: Optimize max_new_tokens for different GPUs ---
+        if max_new_tokens is None:
+            # Set default tokens based on GPU type and capability
+            if torch.cuda.is_available():
+                cuda_capability = torch.cuda.get_device_capability()[0]
+                device_name = torch.cuda.get_device_name().lower()
+                
+                if "l4" in device_name or "rtx 4090" in device_name or "rtx 4080" in device_name:
+                    max_new_tokens = 1000  # Maximum for L4 and RTX 40 series
+                elif "t4" in device_name or "rtx 3090" in device_name or "rtx 3080" in device_name:
+                    max_new_tokens = 800   # High for T4 and RTX 30 series
+                elif cuda_capability >= 8:
+                    max_new_tokens = 600   # High for modern GPUs
+                elif cuda_capability >= 7:
+                    max_new_tokens = 400   # Medium for mid-range GPUs
+                elif cuda_capability >= 6:
+                    max_new_tokens = 200   # Conservative for older GPUs
+                else:
+                    max_new_tokens = 100   # Very conservative for legacy GPUs
+            else:
+                max_new_tokens = 100  # Conservative for CPU
+        else:
+            # Limit max_new_tokens based on GPU capability to prevent OOM
+            if torch.cuda.is_available():
+                cuda_capability = torch.cuda.get_device_capability()[0]
+                device_name = torch.cuda.get_device_name().lower()
+                
+                if "l4" in device_name or "rtx 4090" in device_name or "rtx 4080" in device_name:
+                    max_limit = 1200  # Very high limit for L4 and RTX 40 series
+                elif "t4" in device_name or "rtx 3090" in device_name or "rtx 3080" in device_name:
+                    max_limit = 1000  # High limit for T4 and RTX 30 series
+                elif cuda_capability >= 8:
+                    max_limit = 800   # High limit for modern GPUs
+                elif cuda_capability >= 7:
+                    max_limit = 600   # Medium limit for mid-range GPUs
+                elif cuda_capability >= 6:
+                    max_limit = 300   # Conservative limit for older GPUs
+                else:
+                    max_limit = 150   # Very conservative limit for legacy GPUs
+                
+                if max_new_tokens > max_limit:
+                    logger.warning(f"Limiting max_new_tokens from {max_new_tokens} to {max_limit} for {device_name}")
+                    max_new_tokens = max_limit
 
         # ---- Initial Forward Pass (no kv_cache yet) ----
-        output = self.patched_model(
+        output = compiled_model(
             inputs_embeds=inputs_embeds,
             past_key_values=None,
             use_cache=True,
@@ -374,7 +667,7 @@ class T3(nn.Module):
                 next_token_embed = torch.cat([next_token_embed, next_token_embed])
 
             # Forward pass with only the new token and the cached past.
-            output = self.patched_model(
+            output = compiled_model(
                 inputs_embeds=next_token_embed,
                 past_key_values=past,
                 output_attentions=False,
